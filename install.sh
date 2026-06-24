@@ -1,6 +1,6 @@
 #!/bin/bash
 # ╔══════════════════════════════════════════════════════════════╗
-# ║           fxTunnel Installer - HopingBoyz Edition            ║
+# ║           Eric Tun Installer - HopingBoyz Edition            ║
 # ║                  Created by: HopingBoyz                      ║
 # ║            YouTube: https://www.youtube.com/@hopingboyz      ║
 # ╚══════════════════════════════════════════════════════════════╝
@@ -17,8 +17,28 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # Configuration
-SERVICE_DIR="/etc/systemd/system"
+SERVICE_DIR="/etc/init.d"
 FXTUNNEL_BIN=""
+
+# Helper: map service name to init.d script path
+service_file_path() {
+    echo "${SERVICE_DIR}/$1"
+}
+
+# Helper: check if a service is active via service command
+service_is_active() {
+    service "$1" status > /dev/null 2>&1
+    return $?
+}
+
+# Helper: get service status string
+service_status_str() {
+    if service "$1" status > /dev/null 2>&1; then
+        echo "active"
+    else
+        echo "inactive"
+    fi
+}
 
 # Function to find fxtunnel binary
 find_fxtunnel() {
@@ -30,6 +50,95 @@ find_fxtunnel() {
         FXTUNNEL_BIN=$(command -v fxtunnel)
     else
         FXTUNNEL_BIN=""
+    fi
+}
+
+# Function to list all fxtunnel init.d services
+list_fxtunnel_services() {
+    find "$SERVICE_DIR" -maxdepth 1 -name 'fxtunnel-*' -type f 2>/dev/null \
+        | xargs -I{} basename {} 2>/dev/null
+}
+
+# Write an init.d service script for fxtunnel
+write_service_file() {
+    local service_name="$1"
+    local port="$2"
+    local token="$3"
+    local bin="$4"
+    local file="${SERVICE_DIR}/${service_name}"
+
+    cat > "$file" << EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ${service_name}
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Eric Tun SSH Tunnel - ${service_name}
+### END INIT INFO
+
+DAEMON=${bin}
+ARGS="tcp ${port} -t ${token}"
+PIDFILE=/var/run/${service_name}.pid
+NAME=${service_name}
+
+export HOME=/root
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
+
+case "\$1" in
+  start)
+    echo "Starting \$NAME..."
+    start-stop-daemon --start --background --make-pidfile --pidfile \$PIDFILE \\
+      --exec \$DAEMON -- \$ARGS
+    ;;
+  stop)
+    echo "Stopping \$NAME..."
+    start-stop-daemon --stop --pidfile \$PIDFILE --retry 10
+    rm -f \$PIDFILE
+    ;;
+  restart)
+    \$0 stop
+    sleep 2
+    \$0 start
+    ;;
+  status)
+    if [ -f \$PIDFILE ] && kill -0 \$(cat \$PIDFILE) 2>/dev/null; then
+      echo "\$NAME is running (PID \$(cat \$PIDFILE))"
+      exit 0
+    else
+      echo "\$NAME is not running"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: \$0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+EOF
+    chmod +x "$file"
+}
+
+# Enable service on boot (update-rc.d or chkconfig)
+enable_service_boot() {
+    local service_name="$1"
+    if command -v update-rc.d &>/dev/null; then
+        update-rc.d "$service_name" defaults 2>/dev/null
+    elif command -v chkconfig &>/dev/null; then
+        chkconfig --add "$service_name" 2>/dev/null
+        chkconfig "$service_name" on 2>/dev/null
+    fi
+}
+
+# Disable service on boot
+disable_service_boot() {
+    local service_name="$1"
+    if command -v update-rc.d &>/dev/null; then
+        update-rc.d "$service_name" remove 2>/dev/null
+    elif command -v chkconfig &>/dev/null; then
+        chkconfig "$service_name" off 2>/dev/null
+        chkconfig --del "$service_name" 2>/dev/null
     fi
 }
 
@@ -53,7 +162,7 @@ print_banner() {
     echo "║              ██████╔╝╚██████╔╝   ██║   ███████╗              ║"
     echo "║              ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝              ║"
     echo "║                                                              ║"
-    echo "║                   fxTunnel Manager v1.0                      ║"
+    echo "║                   Eric Tun Manager v1.0                      ║"
     echo "║           YouTube: https://www.youtube.com/@hopingboyz       ║"
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
@@ -102,80 +211,48 @@ check_root() {
 fix_stuck_services() {
     print_section "Checking & Fixing Services"
 
-    local stuck_services=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i fxtunnel | grep "activating" | awk '{print $1}' | sed 's/.service//')
+    local stuck_services=""
+    while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        if ! service_is_active "$svc"; then
+            stuck_services="${stuck_services}${svc}\n"
+        fi
+    done <<< "$(list_fxtunnel_services)"
 
     if [ -n "$stuck_services" ]; then
-        print_warning "Found stuck services in 'activating' state"
+        print_warning "Found services that are not active"
         echo ""
 
-        while IFS= read -r service; do
-            if [ -n "$service" ]; then
-                print_info "Fixing: $service"
+        echo -e "$stuck_services" | while IFS= read -r service; do
+            [ -z "$service" ] && continue
+            print_info "Fixing: $service"
 
-                # Kill any hanging processes
-                service "$service" stop 2>/dev/null
-                pkill -f "fxtunnel.$service" 2>/dev/null || true
-                sleep 2
+            service "$service" stop 2>/dev/null
+            pkill -f "fxtunnel" 2>/dev/null || true
+            sleep 2
 
-                # Reset failed state
-                systemctl reset-failed "$service" 2>/dev/null || true
+            local service_file="${SERVICE_DIR}/${service}"
 
-                # Get service file content
-                local service_file="${SERVICE_DIR}/${service}.service"
-
-                if [ -f "$service_file" ]; then
-                    # Update with correct binary path
-                    find_fxtunnel
-                    if [ -n "$FXTUNNEL_BIN" ]; then
-                        # Get current config
-                        local port=$(grep "ExecStart" "$service_file" | grep -oP 'tcp \K[0-9]+' | head -1)
-                        local token=$(grep "ExecStart" "$service_file" | grep -oP '-t \K[^\s]+' | head -1)
-
-                        # Recreate service file with correct settings
-                        cat > "$service_file" << EOF
-[Unit]
-Description=fxTunnel SSH Tunnel - ${service}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root
-Environment="HOME=/root"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin"
-ExecStart=${FXTUNNEL_BIN} tcp ${port:-22} -t ${token}
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=30
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-                        print_success "Updated service file for $service"
-                    fi
+            if [ -f "$service_file" ]; then
+                find_fxtunnel
+                if [ -n "$FXTUNNEL_BIN" ]; then
+                    local port=$(grep "ARGS=" "$service_file" | grep -oP 'tcp \K[0-9]+' | head -1)
+                    local token=$(grep "ARGS=" "$service_file" | grep -oP '-t \K[^\s]+' | head -1)
+                    write_service_file "$service" "${port:-22}" "$token" "$FXTUNNEL_BIN"
+                    print_success "Updated service file for $service"
                 fi
-
-                # Reload and try to start
-                systemctl daemon-reload
-                service "$service" start 2>/dev/null &
-
-                # Wait and check
-                sleep 5
-
-                local status=$(systemctl is-active "$service" 2>/dev/null)
-                if [ "$status" = "active" ]; then
-                    print_success "$service is now ACTIVE ✓"
-                else
-                    print_error "$service still failing - check logs: journalctl -u $service -n 20"
-                fi
-                echo ""
             fi
-        done <<< "$stuck_services"
 
-        systemctl daemon-reload
+            service "$service" start 2>/dev/null
+            sleep 5
+
+            if service_is_active "$service"; then
+                print_success "$service is now ACTIVE ✓"
+            else
+                print_error "$service still failing - check: service $service status"
+            fi
+            echo ""
+        done
     else
         print_success "No stuck services found"
     fi
@@ -184,79 +261,65 @@ EOF
     read -p "Press Enter to continue..."
 }
 
-# Install fxTunnel
+# Install Eric Tun
 install_fxtunnel() {
-    print_section "Installing fxTunnel"
+    print_section "Installing Eric Tun"
 
-    # Check if already installed
     find_fxtunnel
     if [ -n "$FXTUNNEL_BIN" ]; then
-        print_info "fxTunnel is already installed at: $FXTUNNEL_BIN"
+        print_info "Eric Tun is already installed at: $FXTUNNEL_BIN"
         read -p "Do you want to reinstall? (y/n): " reinstall
         if [[ ! $reinstall =~ ^[Yy]$ ]]; then
             return
         fi
-        # Remove old binary
         rm -f "$FXTUNNEL_BIN"
     fi
 
-    print_info "Downloading and installing fxTunnel..."
+    print_info "Downloading and installing Eric Tun..."
 
-    # Install using official script
     curl -fsSL https://fxtun.dev/install.sh | sh
 
     if [ $? -eq 0 ]; then
-        print_success "fxTunnel installed successfully!"
+        print_success "Eric Tun installed successfully!"
 
-        # Find installed binary
         find_fxtunnel
         if [ -n "$FXTUNNEL_BIN" ]; then
             print_success "Binary location: $FXTUNNEL_BIN"
         else
-            # Manual check
             if [ -f "/root/.local/bin/fxtunnel" ]; then
                 FXTUNNEL_BIN="/root/.local/bin/fxtunnel"
                 chmod +x "$FXTUNNEL_BIN"
             fi
         fi
 
-        # AUTO PATH SETUP
         print_section "Configuring PATH Environment"
-
         print_info "Adding /root/.local/bin to PATH..."
 
-        # Add to root's .bashrc
         if ! grep -q "/root/.local/bin" /root/.bashrc 2>/dev/null; then
             echo 'export PATH=$PATH:/root/.local/bin' >> /root/.bashrc
             print_success "Added to /root/.bashrc"
         fi
 
-        # Also add to /etc/profile for all users
         if ! grep -q "/root/.local/bin" /etc/profile 2>/dev/null; then
             echo 'export PATH=$PATH:/root/.local/bin' >> /etc/profile
         fi
 
-        # Source for current session
         export PATH=$PATH:/root/.local/bin
         source /root/.bashrc 2>/dev/null || true
 
         print_success "PATH configured successfully!"
 
-        # Test fxtunnel
         if [ -x "$FXTUNNEL_BIN" ]; then
             print_success "fxtunnel is executable"
             echo -e "${CYAN}Location: ${YELLOW}$FXTUNNEL_BIN${NC}"
-
-            # Try to get version
             local version=$("$FXTUNNEL_BIN" --version 2>&1 || echo "version check skipped")
             echo -e "${CYAN}Version: ${YELLOW}$version${NC}"
         else
             print_warning "fxtunnel found but not executable, fixing permissions..."
             chmod +x "$FXTUNNEL_BIN" 2>/dev/null || true
         fi
-
     else
-        print_error "Failed to install fxTunnel"
+        print_error "Failed to install Eric Tun"
         print_info "Please check your internet connection and try again"
     fi
 
@@ -266,12 +329,12 @@ install_fxtunnel() {
 
 # Test fxtunnel with token
 test_fxtunnel() {
-    print_section "Test fxTunnel Connection"
+    print_section "Test Eric Tun Connection"
 
     find_fxtunnel
     if [ -z "$FXTUNNEL_BIN" ]; then
-        print_error "fxTunnel not installed!"
-        print_info "Please install fxTunnel first (Option 1)"
+        print_error "Eric Tun not installed!"
+        print_info "Please install Eric Tun first (Option 1)"
         sleep 2
         return
     fi
@@ -289,14 +352,13 @@ test_fxtunnel() {
     print_info "Command: $FXTUNNEL_BIN tcp $test_port -t $test_token"
     echo ""
 
-    # Run fxtunnel in background for 10 seconds to test
     timeout 10 "$FXTUNNEL_BIN" tcp "$test_port" -t "$test_token" 2>&1 &
     local pid=$!
 
     sleep 8
 
     if kill -0 $pid 2>/dev/null; then
-        print_success "Connection test successful! fxTunnel is running"
+        print_success "Connection test successful! Eric Tun is running"
         kill $pid 2>/dev/null
     else
         print_warning "Connection test completed or failed"
@@ -308,73 +370,45 @@ test_fxtunnel() {
 
 # List all existing services
 list_services() {
-    print_section "Existing fxTunnel Services"
+    print_section "Existing Eric Tun Services"
 
-    # Find all fxtunnel services
-    local services=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i fxtunnel | awk '{print $1}' | sed 's/.service//')
+    local services
+    services=$(list_fxtunnel_services)
 
     if [ -z "$services" ]; then
-        print_info "No fxTunnel services found"
+        print_info "No Eric Tun services found"
     else
-        local stuck_count=0
         echo -e "${CYAN}${BOLD}Current services:${NC}"
         echo -e "${WHITE}────────────────────────────────────────────────────────────${NC}"
 
         while IFS= read -r service; do
-            if [ -n "$service" ]; then
-                # Get service status
-                local status=$(systemctl is-active "$service" 2>/dev/null)
+            [ -z "$service" ] && continue
 
-                case $status in
-                    active)
-                        status_color="${GREEN}● ACTIVE${NC}"
-                        ;;
-                    failed)
-                        status_color="${RED}● FAILED${NC}"
-                        ;;
-                    activating)
-                        status_color="${YELLOW}● ACTIVATING (STUCK)${NC}"
-                        ((stuck_count++))
-                        ;;
-                    inactive)
-                        status_color="${YELLOW}● INACTIVE${NC}"
-                        ;;
-                    *)
-                        status_color="${RED}● $status${NC}"
-                        ;;
-                esac
+            local status
+            status=$(service_status_str "$service")
 
-                # Get port from service file
-                local port=$(systemctl cat "$service" 2>/dev/null | grep "ExecStart" | grep -oP 'tcp \K[0-9]+' | head -1)
-                [ -z "$port" ] && port="N/A"
+            case $status in
+                active)
+                    status_color="${GREEN}● ACTIVE${NC}"
+                    ;;
+                *)
+                    status_color="${RED}● INACTIVE${NC}"
+                    ;;
+            esac
 
-                # Get token from service file
-                local token=$(systemctl cat "$service" 2>/dev/null | grep "ExecStart" | grep -oP '-t \K[^\s]+' | head -1)
-                [ -z "$token" ] && token="N/A"
+            local service_file="${SERVICE_DIR}/${service}"
+            local port=$(grep "ARGS=" "$service_file" 2>/dev/null | grep -oP 'tcp \K[0-9]+' | head -1)
+            [ -z "$port" ] && port="N/A"
 
-                # Get service uptime if active
-                local uptime=""
-                if [ "$status" = "active" ]; then
-                    local pid=$(systemctl show -p MainPID "$service" 2>/dev/null | cut -d'=' -f2)
-                    if [ -n "$pid" ] && [ "$pid" != "0" ]; then
-                        uptime=$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')
-                        [ -n "$uptime" ] && uptime=" (Uptime: $uptime)"
-                    fi
-                fi
+            local token=$(grep "ARGS=" "$service_file" 2>/dev/null | grep -oP '-t \K[^\s]+' | head -1)
+            [ -z "$token" ] && token="N/A"
 
-                echo -e "  ${YELLOW}Service:${NC} $service"
-                echo -e "  ${YELLOW}Status:${NC}  $status_color$uptime"
-                echo -e "  ${YELLOW}Port:${NC}    $port"
-                echo -e "  ${YELLOW}Token:${NC}   ${token:0:20}..."
-                echo -e "${WHITE}────────────────────────────────────────────────────────────${NC}"
-            fi
+            echo -e "  ${YELLOW}Service:${NC} $service"
+            echo -e "  ${YELLOW}Status:${NC}  $status_color"
+            echo -e "  ${YELLOW}Port:${NC}    $port"
+            echo -e "  ${YELLOW}Token:${NC}   ${token:0:20}..."
+            echo -e "${WHITE}────────────────────────────────────────────────────────────${NC}"
         done <<< "$services"
-
-        if [ $stuck_count -gt 0 ]; then
-            echo ""
-            print_warning "Found $stuck_count stuck service(s) in 'activating' state!"
-            echo -e "${CYAN}Use Option 10 to fix stuck services${NC}"
-        fi
     fi
 
     echo ""
@@ -383,31 +417,29 @@ list_services() {
 
 # Create new service
 create_service() {
-    print_section "Create New fxTunnel Service"
+    print_section "Create New Eric Tun Service"
 
     find_fxtunnel
     if [ -z "$FXTUNNEL_BIN" ]; then
-        print_error "fxTunnel not installed!"
-        print_info "Please install fxTunnel first (Option 1)"
+        print_error "Eric Tun not installed!"
+        print_info "Please install Eric Tun first (Option 1)"
         sleep 2
         return
     fi
 
-    # Get service name
     while true; do
         read -p "Enter service name (e.g., ssh-tunnel): " service_name
         if [[ -z "$service_name" ]]; then
             print_error "Service name cannot be empty"
         elif [[ ! "$service_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
             print_error "Service name can only contain letters, numbers, hyphens and underscores"
-        elif systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -q "fxtunnel-${service_name}.service"; then
+        elif [ -f "${SERVICE_DIR}/fxtunnel-${service_name}" ]; then
             print_error "Service name already exists! Please choose another name."
         else
             break
         fi
     done
 
-    # Get port number
     while true; do
         read -p "Enter port number to tunnel (default: 22): " port
         port=${port:-22}
@@ -418,9 +450,8 @@ create_service() {
         fi
     done
 
-    # Get token
     while true; do
-        read -p "Enter your fxTunnel token: " token
+        read -p "Enter your Eric Tun token: " token
         if [[ -z "$token" ]]; then
             print_error "Token cannot be empty"
         else
@@ -428,63 +459,26 @@ create_service() {
         fi
     done
 
-    # Create service
     local full_service_name="fxtunnel-${service_name}"
-    local service_file="${SERVICE_DIR}/${full_service_name}.service"
 
     print_info "Creating service: $full_service_name"
     print_info "Binary: $FXTUNNEL_BIN"
     print_info "Port: $port"
     print_info "Token: ${token:0:10}..."
 
-    cat > "$service_file" << EOF
-[Unit]
-Description=fxTunnel SSH Tunnel - ${full_service_name}
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=3
+    write_service_file "$full_service_name" "$port" "$token" "$FXTUNNEL_BIN"
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root
-Environment="HOME=/root"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin"
-ExecStart=${FXTUNNEL_BIN} tcp ${port} -t ${token}
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=30
-TimeoutStopSec=10
-StandardOutput=journal
-StandardError=journal
-KillMode=process
-KillSignal=SIGTERM
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # Reload systemd
-    systemctl daemon-reload
-
-    # Stop any existing instance
     service "$full_service_name" stop 2>/dev/null
-    pkill -f "fxtunnel.${service_name}" 2>/dev/null || true
+    pkill -f "fxtunnel" 2>/dev/null || true
     sleep 2
 
-    # Enable and start service
-    systemctl enable "$full_service_name" 2>/dev/null
+    enable_service_boot "$full_service_name"
     service "$full_service_name" start 2>/dev/null
 
-    # Wait and check status
     print_info "Waiting for service to start..."
     sleep 5
 
-    # Check status
-    local status=$(systemctl is-active "$full_service_name" 2>/dev/null)
-
-    if [ "$status" = "active" ]; then
+    if service_is_active "$full_service_name"; then
         print_success "Service created and running successfully! 🚀"
         echo ""
         echo -e "${GREEN}${BOLD}Service Details:${NC}"
@@ -493,19 +487,9 @@ EOF
         echo -e "  ${YELLOW}Token:${NC}  $token"
         echo -e "  ${YELLOW}Status:${NC} ${GREEN}ACTIVE ✓${NC}"
         echo -e "  ${YELLOW}Command:${NC} service $full_service_name status"
-    elif [ "$status" = "activating" ]; then
-        print_warning "Service is still starting... checking logs:"
-        echo ""
-        journalctl -u "$full_service_name" --no-pager -n 10
-        echo ""
-        print_info "If service doesn't become active, use Option 10 to fix"
     else
-        print_error "Service failed to start. Status: $status"
-        echo ""
-        print_info "Checking logs:"
-        journalctl -u "$full_service_name" --no-pager -n 20
-        echo ""
-        print_info "You can also use Option 10 to fix stuck services"
+        print_error "Service failed to start."
+        print_info "Check: service $full_service_name status"
     fi
 
     echo ""
@@ -514,12 +498,13 @@ EOF
 
 # Edit existing service
 edit_service() {
-    print_section "Edit fxTunnel Service"
+    print_section "Edit Eric Tun Service"
 
-    local services=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i fxtunnel | awk '{print $1}' | sed 's/.service//')
+    local services
+    services=$(list_fxtunnel_services)
 
     if [ -z "$services" ]; then
-        print_error "No fxTunnel services found!"
+        print_error "No Eric Tun services found!"
         sleep 2
         return
     fi
@@ -530,12 +515,12 @@ edit_service() {
     local i=1
     local service_array=()
     while IFS= read -r service; do
-        if [ -n "$service" ]; then
-            local status=$(systemctl is-active "$service" 2>/dev/null)
-            echo -e "  ${YELLOW}$i)${NC} $service (${status})"
-            service_array+=("$service")
-            ((i++))
-        fi
+        [ -z "$service" ] && continue
+        local status
+        status=$(service_status_str "$service")
+        echo -e "  ${YELLOW}$i)${NC} $service (${status})"
+        service_array+=("$service")
+        ((i++))
     done <<< "$services"
 
     echo ""
@@ -548,77 +533,43 @@ edit_service() {
     fi
 
     local selected_service="${service_array[$selection-1]}"
-    local service_file="${SERVICE_DIR}/${selected_service}.service"
+    local service_file="${SERVICE_DIR}/${selected_service}"
 
     print_info "Editing: $selected_service"
     echo ""
 
-    # Get current values
-    local current_port=$(grep "ExecStart" "$service_file" | grep -oP 'tcp \K[0-9]+' | head -1)
-    local current_token=$(grep "ExecStart" "$service_file" | grep -oP '-t \K[^\s]+' | head -1)
+    local current_port=$(grep "ARGS=" "$service_file" | grep -oP 'tcp \K[0-9]+' | head -1)
+    local current_token=$(grep "ARGS=" "$service_file" | grep -oP '-t \K[^\s]+' | head -1)
 
     echo -e "${CYAN}Current configuration:${NC}"
     echo -e "  Port: ${YELLOW}$current_port${NC}"
     echo -e "  Token: ${YELLOW}${current_token:0:15}...${NC}"
     echo ""
 
-    # Get new values
     read -p "Enter new port number (leave blank to keep $current_port): " new_port
     read -p "Enter new token (leave blank to keep current): " new_token
 
     new_port=${new_port:-$current_port}
     new_token=${new_token:-$current_token}
 
-    # Stop service
     print_info "Stopping service..."
     service "$selected_service" stop 2>/dev/null
-    pkill -f "fxtunnel.${selected_service}" 2>/dev/null || true
+    pkill -f "fxtunnel" 2>/dev/null || true
     sleep 2
 
-    # Update service file
     find_fxtunnel
     if [ -n "$FXTUNNEL_BIN" ]; then
-        cat > "$service_file" << EOF
-[Unit]
-Description=fxTunnel SSH Tunnel - ${selected_service}
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root
-Environment="HOME=/root"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin"
-ExecStart=${FXTUNNEL_BIN} tcp ${new_port} -t ${new_token}
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=30
-TimeoutStopSec=10
-StandardOutput=journal
-StandardError=journal
-KillMode=process
-KillSignal=SIGTERM
-
-[Install]
-WantedBy=multi-user.target
-EOF
+        write_service_file "$selected_service" "$new_port" "$new_token" "$FXTUNNEL_BIN"
     fi
 
-    # Reload and start
-    systemctl daemon-reload
     service "$selected_service" start 2>/dev/null
-
     sleep 5
 
-    if systemctl is-active --quiet "$selected_service"; then
+    if service_is_active "$selected_service"; then
         print_success "Service updated and running! ✓"
     else
         print_warning "Service updated but may not be running"
-        echo ""
-        journalctl -u "$selected_service" --no-pager -n 10
+        print_info "Check: service $selected_service status"
     fi
 
     echo ""
@@ -627,12 +578,13 @@ EOF
 
 # Delete service
 delete_service() {
-    print_section "Delete fxTunnel Service"
+    print_section "Delete Eric Tun Service"
 
-    local services=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i fxtunnel | awk '{print $1}' | sed 's/.service//')
+    local services
+    services=$(list_fxtunnel_services)
 
     if [ -z "$services" ]; then
-        print_error "No fxTunnel services found!"
+        print_error "No Eric Tun services found!"
         sleep 2
         return
     fi
@@ -643,12 +595,12 @@ delete_service() {
     local i=1
     local service_array=()
     while IFS= read -r service; do
-        if [ -n "$service" ]; then
-            local status=$(systemctl is-active "$service" 2>/dev/null)
-            echo -e "  ${YELLOW}$i)${NC} $service (${status})"
-            service_array+=("$service")
-            ((i++))
-        fi
+        [ -z "$service" ] && continue
+        local status
+        status=$(service_status_str "$service")
+        echo -e "  ${YELLOW}$i)${NC} $service (${status})"
+        service_array+=("$service")
+        ((i++))
     done <<< "$services"
 
     echo ""
@@ -668,17 +620,12 @@ delete_service() {
     if [[ $confirm =~ ^[Yy]$ ]]; then
         print_info "Stopping and removing $selected_service..."
 
-        # Stop and kill
         service "$selected_service" stop 2>/dev/null
-        systemctl disable "$selected_service" 2>/dev/null
-        pkill -f "fxtunnel.${selected_service}" 2>/dev/null || true
+        pkill -f "fxtunnel" 2>/dev/null || true
+        disable_service_boot "$selected_service"
 
-        # Remove file
-        rm -f "${SERVICE_DIR}/${selected_service}.service"
-
-        # Reload
-        systemctl daemon-reload
-        systemctl reset-failed 2>/dev/null || true
+        rm -f "${SERVICE_DIR}/${selected_service}"
+        rm -f "/var/run/${selected_service}.pid"
 
         print_success "Service deleted permanently! ✓"
     else
@@ -691,12 +638,13 @@ delete_service() {
 
 # View service logs
 view_logs() {
-    print_section "View fxTunnel Service Logs"
+    print_section "View Eric Tun Service Logs"
 
-    local services=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i fxtunnel | awk '{print $1}' | sed 's/.service//')
+    local services
+    services=$(list_fxtunnel_services)
 
     if [ -z "$services" ]; then
-        print_error "No fxTunnel services found!"
+        print_error "No Eric Tun services found!"
         sleep 2
         return
     fi
@@ -707,11 +655,10 @@ view_logs() {
     local i=1
     local service_array=()
     while IFS= read -r service; do
-        if [ -n "$service" ]; then
-            echo -e "  ${YELLOW}$i)${NC} $service"
-            service_array+=("$service")
-            ((i++))
-        fi
+        [ -z "$service" ] && continue
+        echo -e "  ${YELLOW}$i)${NC} $service"
+        service_array+=("$service")
+        ((i++))
     done <<< "$services"
 
     echo ""
@@ -726,22 +673,36 @@ view_logs() {
     local selected_service="${service_array[$selection-1]}"
 
     echo ""
-    echo -e "${CYAN}${BOLD}Live logs for: ${YELLOW}$selected_service${NC}"
+    echo -e "${CYAN}${BOLD}Logs for: ${YELLOW}$selected_service${NC}"
     echo -e "${PURPLE}Press Ctrl+C to exit log view${NC}"
     echo ""
     sleep 1
 
-    journalctl -u "$selected_service" -f --no-hostname
+    # Use /var/log/syslog or /var/log/messages depending on distro
+    local logfile=""
+    if [ -f /var/log/syslog ]; then
+        logfile="/var/log/syslog"
+    elif [ -f /var/log/messages ]; then
+        logfile="/var/log/messages"
+    fi
+
+    if [ -n "$logfile" ]; then
+        tail -f "$logfile" | grep --line-buffered "$selected_service"
+    else
+        print_warning "No suitable log file found. Showing service status:"
+        service "$selected_service" status
+    fi
 }
 
 # Manage service (Start/Stop/Restart)
 manage_service() {
     print_section "Service Management"
 
-    local services=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i fxtunnel | awk '{print $1}' | sed 's/.service//')
+    local services
+    services=$(list_fxtunnel_services)
 
     if [ -z "$services" ]; then
-        print_error "No fxTunnel services found!"
+        print_error "No Eric Tun services found!"
         sleep 2
         return
     fi
@@ -752,19 +713,17 @@ manage_service() {
     local i=1
     local service_array=()
     while IFS= read -r service; do
-        if [ -n "$service" ]; then
-            local status=$(systemctl is-active "$service" 2>/dev/null)
-            if [ "$status" = "active" ]; then
-                status_color="${GREEN}$status${NC}"
-            elif [ "$status" = "activating" ]; then
-                status_color="${YELLOW}$status${NC}"
-            else
-                status_color="${RED}$status${NC}"
-            fi
-            echo -e "  ${YELLOW}$i)${NC} $service (${status_color})"
-            service_array+=("$service")
-            ((i++))
+        [ -z "$service" ] && continue
+        local status
+        status=$(service_status_str "$service")
+        if [ "$status" = "active" ]; then
+            status_color="${GREEN}$status${NC}"
+        else
+            status_color="${RED}$status${NC}"
         fi
+        echo -e "  ${YELLOW}$i)${NC} $service (${status_color})"
+        service_array+=("$service")
+        ((i++))
     done <<< "$services"
 
     echo ""
@@ -793,11 +752,11 @@ manage_service() {
     case $action in
         1)
             service "$selected_service" stop 2>/dev/null
-            pkill -f "fxtunnel.${selected_service}" 2>/dev/null || true
+            pkill -f "fxtunnel" 2>/dev/null || true
             sleep 1
             service "$selected_service" start
             sleep 3
-            if systemctl is-active --quiet "$selected_service"; then
+            if service_is_active "$selected_service"; then
                 print_success "Started successfully ✓"
             else
                 print_error "Failed to start"
@@ -805,28 +764,25 @@ manage_service() {
             ;;
         2)
             service "$selected_service" stop 2>/dev/null
-            pkill -f "fxtunnel.${selected_service}" 2>/dev/null || true
+            pkill -f "fxtunnel" 2>/dev/null || true
             sleep 1
             print_success "Stopped ✓"
             ;;
         3)
-            service "$selected_service" stop 2>/dev/null
-            pkill -f "fxtunnel.${selected_service}" 2>/dev/null || true
-            sleep 2
-            service "$selected_service" start
+            service "$selected_service" restart
             sleep 3
-            if systemctl is-active --quiet "$selected_service"; then
+            if service_is_active "$selected_service"; then
                 print_success "Restarted successfully ✓"
             else
                 print_error "Failed to restart"
             fi
             ;;
         4)
-            systemctl enable "$selected_service"
+            enable_service_boot "$selected_service"
             print_success "Enabled on boot ✓"
             ;;
         5)
-            systemctl disable "$selected_service"
+            disable_service_boot "$selected_service"
             print_success "Disabled on boot ✓"
             ;;
         6)
@@ -841,9 +797,9 @@ manage_service() {
     read -p "Press Enter to continue..."
 }
 
-# Show fxTunnel servers
+# Show Eric Tun servers
 show_servers() {
-    print_section "fxTunnel Available Servers"
+    print_section "Eric Tun Available Servers"
 
     echo -e "${CYAN}${BOLD}Global Server Regions:${NC}"
     echo ""
@@ -875,8 +831,8 @@ create_bulk_services() {
 
     find_fxtunnel
     if [ -z "$FXTUNNEL_BIN" ]; then
-        print_error "fxTunnel not installed!"
-        print_info "Please install fxTunnel first (Option 1)"
+        print_error "Eric Tun not installed!"
+        print_info "Please install Eric Tun first (Option 1)"
         return
     fi
 
@@ -912,50 +868,22 @@ create_bulk_services() {
 
     for port in $(seq "$start_port" "$end_port"); do
         local service_name="fxtunnel-${base_name}-${port}"
-        local service_file="${SERVICE_DIR}/${service_name}.service"
 
-        cat > "$service_file" << EOF
-[Unit]
-Description=fxTunnel SSH Tunnel - ${service_name}
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=3
+        write_service_file "$service_name" "$port" "$token" "$FXTUNNEL_BIN"
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root
-Environment="HOME=/root"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin"
-ExecStart=${FXTUNNEL_BIN} tcp ${port} -t ${token}
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=30
-StandardOutput=journal
-StandardError=journal
-KillMode=process
-KillSignal=SIGTERM
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        systemctl enable "$service_name" 2>/dev/null
+        enable_service_boot "$service_name"
         service "$service_name" start 2>/dev/null
 
         sleep 1
 
-        if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+        if service_is_active "$service_name"; then
             echo -e "  ${GREEN}✓${NC} $service_name (Port: $port) - ACTIVE"
             ((success_count++))
         else
-            echo -e "  ${RED}✗${NC} $service_name (Port: $port) - Check logs"
+            echo -e "  ${RED}✗${NC} $service_name (Port: $port) - Check: service $service_name status"
             ((fail_count++))
         fi
     done
-
-    systemctl daemon-reload
 
     echo ""
     echo -e "${GREEN}${BOLD}Success: $success_count services${NC}"
@@ -970,12 +898,12 @@ EOF
 
 # One-click fix for all services
 fix_all_services() {
-    print_section "Fix All fxTunnel Services"
+    print_section "Fix All Eric Tun Services"
 
     find_fxtunnel
     if [ -z "$FXTUNNEL_BIN" ]; then
-        print_error "fxTunnel not installed! Cannot fix services."
-        print_info "Please install fxTunnel first (Option 1)"
+        print_error "Eric Tun not installed! Cannot fix services."
+        print_info "Please install Eric Tun first (Option 1)"
         sleep 2
         return
     fi
@@ -983,10 +911,11 @@ fix_all_services() {
     print_info "Using fxtunnel binary: $FXTUNNEL_BIN"
     echo ""
 
-    local services=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -i fxtunnel | awk '{print $1}' | sed 's/.service//')
+    local services
+    services=$(list_fxtunnel_services)
 
     if [ -z "$services" ]; then
-        print_error "No fxTunnel services found to fix!"
+        print_error "No Eric Tun services found to fix!"
         sleep 2
         return
     fi
@@ -995,80 +924,37 @@ fix_all_services() {
     echo ""
 
     while IFS= read -r service; do
-        if [ -n "$service" ]; then
-            print_info "Processing: $service"
+        [ -z "$service" ] && continue
+        print_info "Processing: $service"
 
-            # Stop service completely
-            service "$service" stop 2>/dev/null
-            pkill -f "fxtunnel.${service}" 2>/dev/null || true
-            sleep 2
+        service "$service" stop 2>/dev/null
+        pkill -f "fxtunnel" 2>/dev/null || true
+        sleep 2
 
-            # Reset failed state
-            systemctl reset-failed "$service" 2>/dev/null || true
+        local service_file="${SERVICE_DIR}/${service}"
 
-            local service_file="${SERVICE_DIR}/${service}.service"
+        if [ -f "$service_file" ]; then
+            local port=$(grep "ARGS=" "$service_file" | grep -oP 'tcp \K[0-9]+' | head -1)
+            local token=$(grep "ARGS=" "$service_file" | grep -oP '-t \K[^\s]+' | head -1)
+            [ -z "$port" ] && port=22
 
-            if [ -f "$service_file" ]; then
-                local port=$(grep "ExecStart" "$service_file" | grep -oP 'tcp \K[0-9]+' | head -1)
-                local token=$(grep "ExecStart" "$service_file" | grep -oP '-t \K[^\s]+' | head -1)
-
-                [ -z "$port" ] && port=22
-
-                # Recreate service with correct settings
-                cat > "$service_file" << EOF
-[Unit]
-Description=fxTunnel SSH Tunnel - ${service}
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root
-Environment="HOME=/root"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin"
-ExecStart=${FXTUNNEL_BIN} tcp ${port} -t ${token}
-Restart=on-failure
-RestartSec=10
-TimeoutStartSec=30
-TimeoutStopSec=10
-StandardOutput=journal
-StandardError=journal
-KillMode=process
-KillSignal=SIGTERM
-
-[Install]
-WantedBy=multi-user.target
-EOF
-                print_success "Updated config for $service"
-            fi
-
-            # Reload and start
-            systemctl daemon-reload
-            systemctl enable "$service" 2>/dev/null
-            service "$service" start 2>/dev/null &
-
-            sleep 3
-
-            local status=$(systemctl is-active "$service" 2>/dev/null)
-            if [ "$status" = "active" ]; then
-                echo -e "  ${GREEN}✓ $service - ACTIVE${NC}"
-            elif [ "$status" = "activating" ]; then
-                echo -e "  ${YELLOW}⚠ $service - Still activating${NC}"
-                print_info "  Checking logs:"
-                journalctl -u "$service" --no-pager -n 3
-            else
-                echo -e "  ${RED}✗ $service - $status${NC}"
-                print_info "  Checking logs:"
-                journalctl -u "$service" --no-pager -n 3
-            fi
-            echo ""
+            write_service_file "$service" "$port" "$token" "$FXTUNNEL_BIN"
+            print_success "Updated config for $service"
         fi
-    done <<< "$services"
 
-    systemctl daemon-reload
+        enable_service_boot "$service"
+        service "$service" start 2>/dev/null &
+
+        sleep 3
+
+        if service_is_active "$service"; then
+            echo -e "  ${GREEN}✓ $service - ACTIVE${NC}"
+        else
+            echo -e "  ${RED}✗ $service - INACTIVE${NC}"
+            print_info "  Check: service $service status"
+        fi
+        echo ""
+    done <<< "$services"
 
     echo ""
     print_success "All services processed!"
@@ -1081,22 +967,21 @@ main_menu() {
     while true; do
         print_banner
 
-        # Check if fxtunnel is installed
         find_fxtunnel
         if [ -n "$FXTUNNEL_BIN" ]; then
-            echo -e "  ${GREEN}● fxTunnel: Installed (${FXTUNNEL_BIN})${NC}"
+            echo -e "  ${GREEN}● Eric Tun: Installed (${FXTUNNEL_BIN})${NC}"
         else
-            echo -e "  ${RED}● fxTunnel: Not Installed${NC}"
+            echo -e "  ${RED}● Eric Tun: Not Installed${NC}"
         fi
 
-        # Count services
-        local service_count=$(systemctl list-units --type=service --all --no-legend 2>/dev/null | grep -c -i fxtunnel || echo "0")
+        local service_count
+        service_count=$(list_fxtunnel_services | grep -c . || echo "0")
         echo -e "  ${CYAN}● Active Services: $service_count${NC}"
         echo ""
 
         echo -e "${CYAN}${BOLD}Main Menu:${NC}"
         echo -e "${WHITE}────────────────────────────────────────────────────────────${NC}"
-        echo -e "  ${YELLOW}1)${NC}  Install/Update fxTunnel"
+        echo -e "  ${YELLOW}1)${NC}  Install/Update Eric Tun"
         echo -e "  ${YELLOW}2)${NC}  Create New Service"
         echo -e "  ${YELLOW}3)${NC}  List All Services"
         echo -e "  ${YELLOW}4)${NC}  Edit Service"
@@ -1106,7 +991,7 @@ main_menu() {
         echo -e "  ${YELLOW}8)${NC}  Show Available Servers"
         echo -e "  ${YELLOW}9)${NC}  Create Bulk Services"
         echo -e "  ${YELLOW}10)${NC} Fix All Services (Repair)"
-        echo -e "  ${YELLOW}11)${NC} Test fxTunnel Connection"
+        echo -e "  ${YELLOW}11)${NC} Test Eric Tun Connection"
         echo -e "  ${YELLOW}0)${NC}  Exit"
         echo -e "${WHITE}────────────────────────────────────────────────────────────${NC}"
         echo ""
@@ -1126,7 +1011,7 @@ main_menu() {
             11) test_fxtunnel ;;
             0)
                 print_banner
-                echo -e "${GREEN}${BOLD}Thank you for using HopingBoyz fxTunnel Manager!${NC}"
+                echo -e "${GREEN}${BOLD}Thank you for using HopingBoyz Eric Tun Manager!${NC}"
                 echo -e "${CYAN}YouTube: https://www.youtube.com/@hopingboyz${NC}"
                 echo ""
                 exit 0
